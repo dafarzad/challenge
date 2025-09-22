@@ -18,58 +18,86 @@ public class LotteryController : ControllerBase
        _regRepo = repo; _campaignRepo = campaignRepo; _queue = queue; _cache = cache;
     }
 
-    [HttpPost("register")]
-    public async Task<IActionResult> Register([FromBody] RegisterRequestDto dto)
+[HttpPost("register")]
+public async Task<IActionResult> Register(RegisterRequestDto dto)
+{
+    var campaignId = dto.CampaignId;
+    var cacheKey = $"campaign:{campaignId}";
+    Campaign? campaign = null;
+
+    // Try from cache
+    var cached = await _cache.GetStringAsync(cacheKey);
+    if (!string.IsNullOrEmpty(cached))
     {
-        var campaignId = dto.CampaignId;
-        var cacheKey = $"campaign:{campaignId}";
-        Campaign? campaign = null;
-        var cached = await _cache.GetStringAsync(cacheKey);
-        if (!string.IsNullOrEmpty(cached))
+        try
         {
-            try
-            {
-                campaign = JsonSerializer.Deserialize<Campaign>(cached);
-            }
-            catch
-            {
-                campaign = null;
-            }
+            campaign = JsonSerializer.Deserialize<Campaign>(cached);
         }
-
-        if (campaign == null)
+        catch
         {
-            campaign = await _campaignRepo.GetByIdAsync(campaignId);
-            if (campaign == null) return BadRequest(new { error = "Registration is closed" });
+            campaign = null;
+        }
+    }
 
-            var ttl = campaign.EndUtc - DateTime.UtcNow;
-            if (ttl <= TimeSpan.Zero) ttl = TimeSpan.FromMinutes(5);
-            try
+    // Fallback: load from DB if not in cache
+    if (campaign == null)
+    {
+        campaign = await _campaignRepo.GetByIdAsync(campaignId);
+        if (campaign == null)
+            return BadRequest(new { error = "lottery not found" });
+
+       var ttl = TimeSpan.FromDays(1);
+       
+        try
             {
                 await _cache.SetStringAsync(cacheKey, JsonSerializer.Serialize(campaign), ttl);
             }
-            catch 
-            {  }
-        }
+            catch { /* ignore cache failure */ }
+    }
 
-        var requestId = Guid.NewGuid();
+    // ---- Validate campaign time window ----
+    var now = DateTime.UtcNow;
+    if (now < campaign.StartUtc)
+    {
+        return BadRequest(new { error = "lottery has not started yet", startsAt = campaign.StartUtc });
+    }
 
-    var enqueueReq = new EnqueueRequest(requestId, dto.FirstName, dto.LastName, dto.Phone, dto.NationalCode, campaignId, LotteryStatus.Pending, DateTime.UtcNow);
+    if (now > campaign.EndUtc)
+    {
+        return BadRequest(new { error = "lottery has already ended", endedAt = campaign.EndUtc });
+    }
+
+    // ---- If valid, enqueue registration ----
+    var requestId = Guid.NewGuid();
+
+    var enqueueReq = new EnqueueRequest(
+        requestId,
+        dto.FirstName,
+        dto.LastName,
+        dto.Phone,
+        dto.NationalCode,
+        campaignId,
+        LotteryStatus.Pending,
+        DateTime.UtcNow
+    );
+
     await _queue.EnqueueAsync(enqueueReq);
 
+    // Best-effort status caching
     try
     {
         var statusKey = $"lottery:status:{enqueueReq.RequestId}";
-        var entries = new[] {
+        var entries = new[]
+        {
             new KeyValuePair<string,string>("status", enqueueReq.Status.ToString()),
             new KeyValuePair<string,string>("createdAt", enqueueReq.CreatedAt.ToString("o"))
         };
         await _cache.HashSetAsync(statusKey, entries);
     }
-    catch { /* best-effort caching */ }
+    catch { }
 
-        return CreatedAtAction(nameof(Status), new { requestId }, new { requestId });
-    }
+    return CreatedAtAction(nameof(Status), new { requestId }, new { requestId });
+}
 
     [HttpGet("status/{requestId:guid}")]
     public async Task<IActionResult> Status([FromRoute] Guid requestId)
